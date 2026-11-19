@@ -9,6 +9,7 @@ import listenbrainz.db.user as db_user
 from data.model.external_service import ExternalServiceType
 from listenbrainz.domain.external_service import ExternalServiceAPIError
 from listenbrainz.domain.lastfm import LastfmService
+from listenbrainz.listens_importer.librefm import LibrefmImporter
 from listenbrainz.listens_importer.lastfm import BaseLastfmImporter
 from listenbrainz.db.testing import DatabaseTestCase
 from listenbrainz.db import external_service_oauth as db_oauth, listens_importer
@@ -176,3 +177,161 @@ class LastfmRecentTracksTestCase(unittest.TestCase):
         data = self._get(json={"recenttracks": {"@attr": {"totalPages": "1"}, "track": tracks}}, status_code=200)
         self.assertIsInstance(data["recenttracks"]["track"], list)
         self.assertEqual(len(data["recenttracks"]["track"]), 2)
+
+
+class LibrefmImporterTestCase(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.app = listenbrainz.webserver.create_app()
+        self.app.config["TESTING"] = True
+        self.app.config["LIBREFM_API_KEY"] = "test_api_key"
+        self.app.config["LIBREFM_API_URL"] = "https://ws.audioscrobbler.com/2.0/"
+
+        self.user = db_user.get_or_create(self.db_conn, 5, "librefm_testuser")
+        db_oauth.save_token(
+            self.db_conn,
+            user_id=self.user["id"],
+            service=ExternalServiceType.LIBREFM,
+            access_token=None,
+            refresh_token=None,
+            token_expires_ts=None,
+            record_listens=True,
+            scopes=[],
+            external_user_id="deleted_librefm_user",
+            latest_listened_at=datetime.fromtimestamp(0, timezone.utc),
+        )
+
+    def test_deleted_user_disconnects_and_records_non_retryable_error(self):
+        def mock_response(request, context):
+            return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertFalse(status["error"]["retry"])
+        self.assertIsNone(token)
+
+    def test_existing_user_with_empty_range_stays_connected_and_synced(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+            return {"user": {"name": "deleted_librefm_user"}}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(result, (1, 0))
+        self.assertEqual(status["status"]["state"], "Synced")
+        self.assertIsNone(status.get("error"))
+        self.assertIsNotNone(token)
+
+    def test_getinfo_error_is_retryable_and_keeps_connection(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+            return {"error": {"#text": "Operation failed", "code": "8"}}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertTrue(status["error"]["retry"])
+        self.assertIsNotNone(token)
+
+    def test_getinfo_http_failure_is_retryable_and_keeps_connection(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+            context.status_code = 500
+            return {"message": "Service unavailable"}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertTrue(status["error"]["retry"])
+        self.assertIsNotNone(token)
+        self.assertEqual(result, (0, 1))
+
+    def test_getinfo_404_disconnects_and_records_non_retryable_error(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+            context.status_code = 404
+            return {"message": "User not found"}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertFalse(status["error"]["retry"])
+        self.assertIsNone(token)
+
+    def test_unexpected_getinfo_payload_is_retryable_and_keeps_connection(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                return {"error": {"#text": "Invalid resource specified", "code": "7"}}
+            return {"user": []}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertTrue(status["error"]["retry"])
+        self.assertIsNotNone(token)
