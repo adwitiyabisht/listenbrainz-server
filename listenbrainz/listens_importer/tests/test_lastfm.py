@@ -335,3 +335,78 @@ class LibrefmImporterTestCase(DatabaseTestCase):
         self.assertEqual(status["status"]["state"], "Error")
         self.assertTrue(status["error"]["retry"])
         self.assertIsNotNone(token)
+
+    def test_recent_tracks_404_with_missing_getinfo_disconnects_and_records_non_retryable_error(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                context.status_code = 404
+                return {"message": "User not found"}
+            context.status_code = 404
+            return {"message": "User not found"}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertFalse(status["error"]["retry"])
+        self.assertIn("not found", status["error"]["message"])
+        self.assertIsNone(token)
+
+    def test_recent_tracks_404_with_existing_getinfo_keeps_connection_and_is_retryable(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                context.status_code = 404
+                return {"message": "Not found"}
+            return {"user": {"name": "deleted_librefm_user"}}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertTrue(status["error"]["retry"])
+        self.assertIsNotNone(token)
+
+    def test_recent_tracks_404_with_transient_getinfo_keeps_connection_and_is_retryable(self):
+        def mock_response(request, context):
+            if request.qs["method"] == ["user.getrecenttracks"]:
+                context.status_code = 404
+                return {"message": "Not found"}
+            context.status_code = 503
+            return {"message": "Service unavailable"}
+
+        with self.app.app_context(), requests_mock.Mocker() as mocker:
+            mocker.get(self.app.config["LIBREFM_API_URL"], json=mock_response)
+            importer = LibrefmImporter()
+            result = importer.process_all_users()
+
+        status = listens_importer.get_import_status(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+        token = db_oauth.get_token(
+            self.db_conn, self.user["id"], ExternalServiceType.LIBREFM
+        )
+
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(status["status"]["state"], "Error")
+        self.assertTrue(status["error"]["retry"])
+        self.assertIsNotNone(token)

@@ -109,7 +109,7 @@ class BaseLastfmImporter(ListensImporter):
                         data["recenttracks"]["track"] = [tracks]
                 return data
             case 404:
-                raise LastfmUserNotRetryableException("Last.FM user with username %s not found" % (params["user"],))
+                self.handle_recent_tracks_not_found(session, user)
             case 429:
                 raise ExternalServiceError("Encountered a rate limit.")
             case 400 | 403:
@@ -127,6 +127,11 @@ class BaseLastfmImporter(ListensImporter):
 
     def handle_no_tracks_error(self, session, user):
         return {"recenttracks": {"@attr": {"totalPages": "0"}, "track": []}}
+
+    def handle_recent_tracks_not_found(self, session, user):
+        raise LastfmUserNotRetryableException(
+            "Last.FM user with username %s not found" % (user["external_user_id"],)
+        )
 
     def get_total_pages(self, session, user):
         response = self.get_user_recent_tracks(session, user, page=1)
